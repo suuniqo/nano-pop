@@ -2,21 +2,27 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Session
-  ( startSession
+  ( SessionErr (..)
+  , Reply
+  , startSession
   , processQuery
-  , processUpdate
+  , withAuth
   ) where
 
-import Data.Time.Clock.POSIX (POSIXTime)
-import Data.ByteString (ByteString)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Word (Word64)
-import Data.Set (Set, empty)
-import Query (Query(..), QueryErr)
-import Storage (UID, Message)
 
-data StatResponse = StatResponse
+import Query (Query (..), QueryErr)
+import Storage (Message, Username, userValidate, StorageErr, UID, withLock, fetchMailbox, Lock)
+import Data.ByteString (ByteString)
+import Error (SysErr)
+
+-- Data
+
+data StatReply = StatResponse
   { statCount :: Word
-  , statSize  :: Word64
+  , statSize  :: Word
   }
 
 data ListEntry = ListEntry
@@ -24,7 +30,7 @@ data ListEntry = ListEntry
   , listSize :: Word64
   }
 
-data ListResponse
+data ListReply
   = ListOne ListEntry
   | ListAll [ListEntry]
 
@@ -33,79 +39,122 @@ data UidlEntry = UidlEntry
   , uidlUID :: UID
   }
 
-data UidlResponse
+data UidlReply
   = UidlOne UidlEntry
   | UidlAll [UidlEntry]
 
-newtype RetrResponse = RetrResponse { retrContent :: ByteString}
+newtype RetrReply = RetrResponse { retrContent :: ByteString }
 
-data ErrType
-  = NoSuchUser
-  | InvalidPwd
-  | FailedLock
-  | FailedScan 
+data Reply
+  = RepUser Username
+  | RepPass Username
+  | RepDele Word
+  | RepNoop
+  | RepRset
+  | RepQuit (Maybe Username)
+  | RepStat StatReply
+  | RepList ListReply
+  | RepUidl UidlReply
+  | RepRetr RetrReply
+
+data SessionErr
+  = Sys SysErr
+  | Query QueryErr
+  | Storage StorageErr
+  | InvalidPhase
+  | AlreadyDele
   | NoSuchMsg
-  | FailedDel
-  | AlreadyDel { deleErrId :: Word }
 
-data OkType
-  = OkUser { userUsername :: ByteString }
-  | OkPass
-  | OkDele { deleOkId :: Word }
-  | OkNoop
-  | OkRset
-  | OkQuit
-
-data Response
-  = StatResp StatResponse
-  | ListResp ListResponse
-  | UidlResp UidlResponse
-  | RetrResp RetrResponse
-  | Ok  OkType
-  | Err ErrType
-
-data SessionErr 
-  = Query QueryErr
-  | InvalidState
+-- Phases
 
 data Auth
+data Authed
 data Trans
 data Update
 
-data Session s where
-  AuthSession   :: Session Auth
-  TransSession  :: ByteString -> [Message] -> Set Word -> Session Trans
-  UpdateSession :: ByteString -> Set Word -> Session Update
+data Phase s where
+  AuthPhase   :: Maybe Username -> Phase Auth
+  AuthedPhase :: Username -> Phase Authed
+  TransPhase  :: Username -> Lock -> [Message] -> Set Word -> Phase Trans
+  UpdatePhase :: Username -> Lock -> Set Word -> Phase Update
 
 data Transition s
-  = Stay (Session s)
-  | Next (Session (Next s))
+  = Stay (Phase s)
+  | Next (Phase (Next s))
+  | Term
 
-class Phase s where
+class Process s where
   type Next s
 
-  processQuery :: Session s -> Either QueryErr Query -> Either SessionErr (Transition s, Response)
+  processQuery :: Phase s -> Either QueryErr Query -> Either SessionErr (Transition s, Reply)
   processQuery session query =
     case query of
       Left err -> Left (Query err)
       Right ok -> process session ok
 
-  process :: Session s -> Query -> Either SessionErr (Transition s, Response)
+  process :: Phase s -> Query -> Either SessionErr (Transition s, Reply)
 
-startSession :: Session Auth
-startSession = AuthSession
+-- Authentication Phase
 
-instance Phase Auth where
-  type Next Auth = Trans
+startSession :: Phase Auth
+startSession = AuthPhase Nothing
 
-  process AuthSession query = case query of
-    User user -> Right (Next (TransSession user [] empty), Ok (OkUser user))
-    _         -> Left InvalidState
+processUser :: ByteString -> Either SessionErr (Transition Auth, Reply)
+processUser user = case userValidate user of
+  Right user' -> Right
+    ( Stay $ AuthPhase (Just user')
+    , RepUser user'
+    )
+  Left err -> Left $ Storage err
 
-instance Phase Trans where
+processPass :: Username -> ByteString -> Either SessionErr (Transition Auth, Reply)
+processPass user _ = Right (Next (AuthedPhase user), RepPass user)
+
+processQuitAuth :: Maybe Username -> Either SessionErr (Transition Auth, Reply)
+processQuitAuth user = Right (Term, RepQuit user)
+
+instance Process Auth where
+  type Next Auth = Authed
+
+  process (AuthPhase Nothing) query = case query of
+    User name -> processUser name
+    Quit      -> processQuitAuth Nothing
+    _         -> Left InvalidPhase
+
+  process (AuthPhase (Just user)) query = case query of
+    User name -> processUser name
+    Pass pass -> processPass user pass
+    Quit      -> processQuitAuth (Just user)
+    _         -> Left InvalidPhase
+
+-- Transaction Phase
+
+wrapLock :: Username -> (Phase Trans -> IO a) -> Lock -> IO (Either SessionErr a)
+wrapLock user action lock = do
+  maildrop <- fetchMailbox lock user
+
+  case maildrop of
+    Left err   -> pure $ Left (Storage err)
+    Right msgs -> Right <$> action (TransPhase user lock msgs Set.empty)
+
+withAuth :: Phase Authed -> (Phase Trans -> IO a) -> IO (Either SessionErr a)
+withAuth (AuthedPhase user) action = do
+  result <- withLock user (wrapLock user action)
+
+  case result of
+    Left err  -> pure $ Left (Storage err)
+    Right res -> pure res
+
+instance Process Trans where
   type Next Trans = Update
 
-  process (TransSession user msgs dels) query = undefined
-
-processUpdate :: Session Update -> IO Response
-processUpdate (UpdateSession user dels) = undefined
+  process (TransPhase user lock msgs dels) query = case query of
+    Stat     -> undefined
+    List opt -> undefined
+    Uidl opt -> undefined
+    Retr msg -> undefined
+    Dele msg -> undefined
+    Noop     -> undefined
+    Rset     -> undefined
+    Quit     -> undefined
+    _        -> Left InvalidPhase

@@ -26,6 +26,13 @@ data Oper
   | OpTimeout
   | OpSend SockAddr
   | OpRecv SockAddr
+  | OpDirExist FilePath
+  | OpOpen FilePath
+  | OpClose FilePath
+  | OpUnlink FilePath
+  | OpListDir FilePath
+  | OpStatFile FilePath
+  | OpMove FilePath FilePath
 
 instance Show Oper where
   show op = case op of
@@ -38,6 +45,13 @@ instance Show Oper where
     OpRecv addr     -> "failed when receiving query on " ++ show addr
     OpSend addr     -> "failed when sending response on " ++ show addr
     OpTimeout       -> "failed to perform timeout"
+    OpDirExist path -> "failed when checking existance of directory " ++ path
+    OpOpen path     -> "failed when opening file " ++ path
+    OpClose path    -> "failed when closing file " ++ path
+    OpUnlink path   -> "failed when unlinking file " ++ path
+    OpListDir path  -> "failed when listing directory " ++ path
+    OpStatFile path -> "failed to stat file " ++ path
+    OpMove src dst  -> "failed to move file from " ++ src ++ " to " ++ dst
 
 data SysErr = SysErr
   { seOper :: Oper

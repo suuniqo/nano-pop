@@ -1,11 +1,15 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
 
 module Server
-  ( Listener , acquireListener , releaseListener , withListener
-  , Connection(..) , acquireClient , releaseClient , withClient, withClient'
-  , ClientErr(..), sendClient, recvClient
+  ( Listener
+  , withListener
+  , Connection (..)
+  , withClient
+  , withClient'
+  , ClientErr (..)
+  , sendClient
+  , recvClient
   ) where
 
 import GHC.IO.Exception (IOErrorType(Interrupted, ResourceVanished, ResourceExhausted))
@@ -45,7 +49,7 @@ import Error
 import Log (emit, Severity (Warn))
 import Network.Socket.ByteString (sendAll, recv)
 import Data.ByteString (ByteString)
-import Config (listenBacklog, maxSizeQuery, backoffMin, backoffMax, idleTimeout)
+import Config (listenBacklog, maxSizeQuery, backoffMin, backoffMax, idleTimeout, readChunk)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 
 import qualified Data.ByteString as BS
@@ -81,7 +85,7 @@ trySendAll addr sock msg = annotate (OpSend addr) call
 
 tryRecv :: SockAddr -> Socket -> IO ByteString
 tryRecv addr sock = annotate (OpRecv addr) call
-  where call = recv sock 4096 
+  where call = recv sock readChunk 
 
 tryTimeout :: Int -> IO a -> IO (Maybe a)
 tryTimeout time action = annotate OpTimeout call
@@ -178,11 +182,11 @@ acquireClient listener = do
 releaseClient :: Connection -> IO ()
 releaseClient = close . connSock
 
-withClient' :: Connection -> (Connection -> IO a) -> IO a
-withClient' conn = bracket (pure conn) releaseClient
-
 withClient :: Listener -> (Connection -> IO a) -> IO a
 withClient listener = bracket (acquireClient listener) releaseClient
+
+withClient' :: Connection -> (Connection -> IO a) -> IO a
+withClient' conn = bracket (pure conn) releaseClient
 
 sendClient :: Connection -> ByteString -> IO ()
 sendClient conn = trySendAll (connPeer conn) (connSock conn)
@@ -199,7 +203,7 @@ data ClientErr
   | EOF
 
 instance Show ClientErr where
-  show = \case
+  show err = case err of
     TooLong -> "query is too long"
     Timeout -> "client idle timeout"
     EOF     -> "client disconnected"

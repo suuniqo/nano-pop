@@ -76,19 +76,22 @@ upperFirst (x:xs) = Just (BS.map toUpper x, xs)
 tokenize :: ByteString -> Maybe (ByteString, [ByteString])
 tokenize = upperFirst . BS.words
 
+parsers :: [(ByteString, [ByteString] -> Either QueryErr Query)]
+parsers = 
+  [ ("USER", parseString User)
+  , ("PASS", parseString Pass)
+  , ("LIST", parseMaybeWord List)
+  , ("UIDL", parseMaybeWord Uidl)
+  , ("RETR", parseWord Retr)
+  , ("DELE", parseWord Dele)
+  , ("STAT", parseVoid Stat)
+  , ("NOOP", parseVoid Noop)
+  , ("RSET", parseVoid Rset)
+  , ("QUIT", parseVoid Quit)
+  ]
+
 parserOf :: ByteString -> Maybe ([ByteString] -> Either QueryErr Query)
-parserOf cmd = case cmd of
-  "USER" -> Just $ parseString User
-  "PASS" -> Just $ parseString Pass
-  "LIST" -> Just $ parseMaybeWord List
-  "UIDL" -> Just $ parseMaybeWord Uidl
-  "RETR" -> Just $ parseWord Retr
-  "DELE" -> Just $ parseWord Dele
-  "STAT" -> Just $ parseVoid Stat
-  "NOOP" -> Just $ parseVoid Noop
-  "RSET" -> Just $ parseVoid Rset
-  "QUIT" -> Just $ parseVoid Quit
-  _      -> Nothing
+parserOf = flip lookup parsers
 
 parseQuery :: ByteString -> Either QueryErr Query
 parseQuery line = case tokenize line of

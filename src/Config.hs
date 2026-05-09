@@ -4,6 +4,7 @@ module Config
   , backoffMin
   , backoffMax
   , idleTimeout
+  , readChunk
   , maxSizeQuery
   , maxSizeResponse
   ) where
@@ -29,6 +30,9 @@ backoffMin = secInMicro `div` 16
 
 backoffMax :: Int
 backoffMax = secInMicro * 16
+
+readChunk :: Int
+readChunk = 4096
 
 -- Fixed (Protocol)
 
