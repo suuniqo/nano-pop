@@ -31,7 +31,7 @@ data Oper
   | OpOpen FilePath
   | OpClose FilePath
   | OpUnlink FilePath
-  | OpListDir FilePath
+  | OpListDir
   | OpStatFile FilePath
   | OpMove FilePath FilePath
   | OpRead
@@ -52,7 +52,7 @@ instance Show Oper where
     OpOpen path     -> "failed when opening file " ++ path
     OpClose path    -> "failed when closing file " ++ path
     OpUnlink path   -> "failed when unlinking file " ++ path
-    OpListDir path  -> "failed when listing directory " ++ path
+    OpListDir       -> "failed when listing directory"
     OpStatFile path -> "failed to stat file " ++ path
     OpMove src dst  -> "failed to move file from " ++ src ++ " to " ++ dst
     OpRead          -> "failed when reading file"
@@ -65,7 +65,7 @@ data SysErr = SysErr
 
 instance Show SysErr where
   show (SysErr op err) =
-    show op ++ " -> " ++ displayException err
+    show op ++ ": " ++ displayException err
 
 instance Exception SysErr
 

@@ -1,4 +1,4 @@
-# Revision history for nano-pop
+# Revision history for npop
 
 ## 0.1.0.0 -- YYYY-mm-dd
 

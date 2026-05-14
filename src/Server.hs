@@ -1,19 +1,18 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Server
   ( Listener
   , withListener
   , Connection (..)
-  , acquireClient
   , withClient
-  , withClient'
   , ClientErr (..)
   , sendClient
   , recvClient
   ) where
 
-import GHC.IO.Exception (IOErrorType(Interrupted, ResourceVanished, ResourceExhausted, ResourceBusy))
+import GHC.IO.Exception (IOErrorType(Interrupted, ResourceVanished, ResourceExhausted))
 
 import Network.Socket
   ( withSocketsDo
@@ -36,7 +35,9 @@ import Network.Socket
 
 import Control.Concurrent (threadDelay)
 
-import Control.Exception (throwIO, bracketOnError, catch, bracket)
+import Control.Exception (throwIO, bracketOnError, catch, handle, SomeException)
+import qualified UnliftIO.Concurrent as UIOC
+import qualified UnliftIO as UIO
 
 import System.Random
 
@@ -50,15 +51,20 @@ import Error
 import Log (emit, Severity (Warn))
 import Network.Socket.ByteString (sendAll, recv)
 import Data.ByteString (ByteString)
-import Config (listenBacklog, maxSizeQuery, backoffMin, backoffMax, idleTimeout, readChunk)
+import Constant (queryMaxLen)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 
-import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS
 import System.Timeout (timeout)
+import Data.Functor
+import App (App, AppEnv (config))
+import Control.Monad.IO.Class (MonadIO(liftIO))
+import Config (Config(network), NetworkConfig (backoffMin, readChunk, backoffMax, listenBacklog, port, idleTimeout))
+import Control.Monad.RWS (asks)
 
 tryGetAddrInfo :: AddrInfo -> ServiceName -> IO [AddrInfo]
-tryGetAddrInfo hints port = annotate OpAddrInfo call
-  where call = getAddrInfo (Just hints) Nothing (Just port)
+tryGetAddrInfo hints host = annotate OpAddrInfo call
+  where call = getAddrInfo (Just hints) Nothing (Just host)
 
 tryOpenSock :: AddrInfo -> IO Socket
 tryOpenSock addr = annotate (OpOpenSock $ addrAddress addr) call
@@ -84,9 +90,9 @@ trySendAll :: SockAddr -> Socket -> ByteString -> IO ()
 trySendAll addr sock msg = annotate (OpSend addr) call
   where call = sendAll sock msg
 
-tryRecv :: SockAddr -> Socket -> IO ByteString
-tryRecv addr sock = annotate (OpRecv addr) call
-  where call = recv sock readChunk 
+tryRecv :: SockAddr -> Socket -> Int -> IO ByteString
+tryRecv addr sock chunkSize = annotate (OpRecv addr) call
+  where call = recv sock chunkSize
 
 tryTimeout :: Int -> IO a -> IO (Maybe a)
 tryTimeout time action = annotate OpTimeout call
@@ -107,32 +113,35 @@ tryCandidate addr = bracketOnError (tryOpenSock addr) close setupSock
       tryBindSock addr sock
       pure (sock, addr)
 
-bindCandidate :: [AddrInfo] -> IO (Socket, AddrInfo) 
+bindCandidate :: [AddrInfo] -> IO (Socket, AddrInfo)
 bindCandidate []     = throwIO noCandidatesErr
 bindCandidate [a]    = tryCandidate a
 bindCandidate (a:as) = tryCandidate a `catch` \(err :: SysErr) -> do
   case seOper err of
     OpSockOpt -> throwIO err
     _         -> do
-      emit Warn err
+      emit Warn (show err)
       bindCandidate as
 
 type Listener = Socket
 
-acquireListener :: ServiceName -> IO Listener
-acquireListener host = withSocketsDo $ do
-  addrs <- resolve host
+acquireListener :: ServiceName -> Int -> IO Listener
+acquireListener host backlog = withSocketsDo $ do
+  addrs        <- resolve host
   (sock, addr) <- bindCandidate addrs
 
-  tryListenSock addr sock listenBacklog
+  tryListenSock addr sock backlog
 
   pure sock
 
 releaseListener :: Listener -> IO ()
 releaseListener = close
 
-withListener :: ServiceName -> (Listener -> IO a) -> IO a
-withListener port = bracket (acquireListener port) releaseListener
+withListener :: (Listener -> App a) -> App a
+withListener action = do
+  host    <- asks (port . network . config)
+  backlog <- asks (listenBacklog . network . config)
+  UIO.bracket (liftIO $ acquireListener host backlog) (liftIO . releaseListener) action
 
 data Connection = Connection
   { connSock :: Socket
@@ -140,25 +149,28 @@ data Connection = Connection
   , connBuff :: IORef ByteString
   }
 
+instance Show Connection where
+  show = show . connPeer
+
 data RetryType
   = Immediate
   | Backoff
   | Stop
 
 retryBackoff :: Int -> Int -> (SysErr -> RetryType) -> IO a -> IO a
-retryBackoff minDelay maxDelay shouldRetry action = go (min minDelay maxDelay)
+retryBackoff delayMin delayMax shouldRetry action = go delayMin
   where
     go delay = action `catch` \(err :: SysErr) ->
       case shouldRetry err of
         Stop -> throwIO err
         Immediate -> do
-          emit Warn err
+          emit Warn (show err)
           go delay
         Backoff -> do
-          emit Warn err
+          emit Warn (show err)
           jitter <- randomRIO (0, delay `div` 2)
           threadDelay (delay `div` 2 + jitter)
-          go (min (delay*2) maxDelay)
+          go (min (delay*2) delayMax)
 
 shouldRetryAccept :: SysErr -> RetryType
 shouldRetryAccept err =
@@ -168,26 +180,35 @@ shouldRetryAccept err =
     ResourceExhausted  -> Backoff
     _                  -> Stop
 
-acquireClient :: Listener -> IO Connection
-acquireClient listener = do
-  (sock, addr) <- retryAccept
-  buff <- newIORef BS.empty
-  pure $ Connection sock addr buff
+acquireClient :: Listener -> App Connection
+acquireClient listener =
+  do
+    delayMin     <- asks (backoffMin . network . config)
+    delayMax     <- asks (backoffMax . network . config)
+
+    (sock, addr) <- liftIO (retryAccept delayMin delayMax)
+    buff         <- liftIO (newIORef BS.empty)
+
+    pure $ Connection sock addr buff
   where
-    retryAccept = retryBackoff
-      backoffMin
-      backoffMax
+    retryAccept bmin bmax =
+      retryBackoff bmin bmax
       shouldRetryAccept
       (tryAcceptClient listener)
 
 releaseClient :: Connection -> IO ()
 releaseClient = close . connSock
 
-withClient :: Listener -> (Connection -> IO a) -> IO a
-withClient listener = bracket (acquireClient listener) releaseClient
+type Handler = Connection -> Either SomeException () -> App ()
 
-withClient' :: Connection -> (Connection -> IO a) -> IO a
-withClient' conn = bracket (pure conn) releaseClient
+withClient :: Listener -> (Connection -> App ()) -> Handler -> App ()
+withClient listener action handleExcp = do
+  conn <- acquireClient listener
+
+  let release = liftIO (releaseClient conn)
+  let handleExcp' excp = handleExcp conn excp `UIO.finally` release
+
+  void $ UIOC.forkFinally (action conn) handleExcp'
 
 sendClient :: Connection -> ByteString -> IO ()
 sendClient conn = trySendAll (connPeer conn) (connSock conn)
@@ -209,31 +230,65 @@ instance Show ClientErr where
     Timeout -> "autologout timeout expired"
     Disconn -> "client disconnected"
 
-recvClient :: Connection -> IO (Either ClientErr ByteString)
-recvClient conn = do
-  buff <- readIORef $ connBuff conn
-  go buff
+data FetchResult
+  = Chunk ByteString
+  | PeerTimeout
+  | PeerDisconn
+
+fetchChunk :: Connection -> App FetchResult
+fetchChunk conn = do
+  chunkSize <- asks (readChunk   . network . config)
+  delayMin  <- asks (backoffMin  . network . config)
+  delayMax  <- asks (backoffMax  . network . config)
+  time      <- asks (idleTimeout . network . config)
+
+  liftIO $ handle recvErr $
+    tryTimeout time (retryRecv delayMin delayMax chunkSize)
+    <&> maybe PeerTimeout Chunk
   where
-    retryRecv = retryBackoff
-      backoffMin
-      backoffMax
-      shouldRetryRecv
-      (tryRecv (connPeer conn) (connSock conn))
-    go buff = case BS.breakSubstring "\r\n" buff of
-      (line, rest)
-        | BS.length line + 2 > maxSizeQuery ->
-            pure (Left TooLong)
-        | not (BS.null rest) -> do
-            writeIORef (connBuff conn) (BS.drop 2 rest)
-            pure (Right line)
-        | otherwise -> do
-            maybeChunk <- tryTimeout idleTimeout retryRecv
-              `catch` \(err :: SysErr) -> case classify err of
-                ResourceBusy  -> pure (Just BS.empty)
-                _             -> throwIO err
-            case maybeChunk of
-              Nothing -> pure (Left Timeout)
-              Just chunk -> do
-                if BS.null chunk
-                then pure (Left Disconn)
-                else go (buff <> chunk)
+    retryRecv bmin bmax = retryBackoff bmin bmax shouldRetryRecv . tryRecv (connPeer conn) (connSock conn)
+    recvErr err = case classify err of
+      ResourceVanished -> pure PeerDisconn
+      _                -> throwIO err
+
+data SplitResult
+  = Complete ByteString ByteString
+  | Incomplete
+  | Overflow (Maybe ByteString)
+
+stripCRLF :: ByteString -> ByteString
+stripCRLF = BS.drop 2
+
+splitLine :: ByteString -> SplitResult
+splitLine buff =
+  case BS.breakSubstring "\r\n" buff of
+    (line, rest)
+      | BS.length line + 2 > queryMaxLen -> evalOverflow rest
+      | BS.null rest                      -> Incomplete
+      | otherwise                         -> Complete line (stripCRLF rest)
+  where
+    evalOverflow rest
+      | BS.null rest = Overflow Nothing
+      | otherwise    = Overflow $ Just (stripCRLF rest)
+
+drainLine :: Connection -> App (Either ClientErr ByteString)
+drainLine conn = fetchChunk conn >>= \case
+  PeerDisconn -> pure (Left Disconn)
+  PeerTimeout -> pure (Left Timeout)
+  Chunk bytes ->
+    case BS.breakSubstring "\r\n" bytes of
+      (_, rest) | not (BS.null rest) -> liftIO $ writeIORef (connBuff conn) (stripCRLF rest) $> Left TooLong
+      _                              -> drainLine conn
+
+recvClient :: Connection -> App (Either ClientErr ByteString)
+recvClient conn = liftIO (readIORef (connBuff conn)) >>= go
+  where
+    go buff = do
+      case splitLine buff of
+        Overflow Nothing     -> drainLine conn
+        Overflow (Just rest) -> liftIO $ writeIORef (connBuff conn) rest $> Left TooLong
+        Complete line rest   -> liftIO $ writeIORef (connBuff conn) rest $> Right line
+        Incomplete -> fetchChunk conn >>= \case
+          PeerDisconn -> pure (Left Disconn)
+          PeerTimeout -> pure (Left Timeout)
+          Chunk bytes -> go (buff <> bytes)

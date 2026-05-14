@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Serialize where
+module Serialize (serialize, excpResponse) where
 
 import Data.List (dropWhileEnd)
 import Data.ByteString (ByteString, intercalate)
@@ -36,17 +36,20 @@ tryReadFile path = annotate OpRead call
 crlf :: ByteString
 crlf = "\r\n"
 
-ok :: ByteString
-ok = "+OK"
+okInd :: ByteString
+okInd = "+OK"
 
 okReply :: ByteString
-okReply = ok <> crlf
+okReply = okInd <> crlf
 
 term :: ByteString
 term = "." <> crlf
 
-err :: ByteString
-err = "-ERR"
+errInd :: ByteString
+errInd = "-ERR"
+
+excpResponse :: ByteString
+excpResponse = errInd <> " " <> "internal failure"
 
 -- Formatting
 
@@ -66,7 +69,7 @@ class Serialize a where
 
 instance Serialize Reply where
   serialize reply = case reply of
-    RepHelo      -> pure $ ok <> " POP3 server ready" <> crlf
+    RepHelo      -> pure $ okInd <> " POP3 server ready" <> crlf
     RepUser      -> pure okReply
     RepPass pass -> serialize pass
     RepStat stat -> serialize stat
@@ -77,11 +80,11 @@ instance Serialize Reply where
     RepNoop      -> pure okReply
     RepUidl uidl -> serialize uidl
     RepQuit quit -> serialize quit
-    RepErr  erro -> serialize erro
+    RepErr  err -> serialize err
 
 -- +OK <user>'s maildrop has <count> messages (<size> octets)
 instance Serialize PassReply where
-  serialize pass = pure $ ok
+  serialize pass = pure $ okInd
     <> " "
     <> (pack . show . passUser) pass
     <> "'s maildrop has "
@@ -93,7 +96,7 @@ instance Serialize PassReply where
 
 -- +OK nn mm
 instance Serialize StatReply where
-  serialize stat = pure $ ok
+  serialize stat = pure $ okInd
     <> " "
     <> (pack . show . statCount) stat
     <> " "
@@ -117,18 +120,10 @@ instance Serialize ListReply where
   serialize list = case list of
     ListOne entry -> do
       s <- serialize entry
-      pure $ ok <> " " <> s <> crlf
+      pure $ okInd <> " " <> s <> crlf
     ListAll entries -> do
       serialized <- mapM serialize entries
-      let count  = length entries
-          size   = sum (map listSize entries)
-          header = ok
-            <> " "
-            <> (pack . show) count
-            <> " messages ("
-            <> (pack . show) size
-            <> " octets)"
-      pure $ intercalate crlf (header : serialized ++ [term])
+      pure $ intercalate crlf (okInd : serialized ++ [term])
 
 -- +OK <size> octets
 -- <file contents>
@@ -137,7 +132,7 @@ instance Serialize RetrReply where
   serialize retr = do
     contents <- formatFile <$> tryReadFile (retrPath retr)
 
-    let header = ok
+    let header = okInd
           <> " "
           <> (pack . show) (retrSize retr)
           <> " octets"
@@ -148,7 +143,7 @@ instance Serialize RetrReply where
   
 -- +OK message <id> deleted
 instance Serialize DeleReply where
-  serialize dele = pure $ ok
+  serialize dele = pure $ okInd
     <> " message "
     <> (pack . show . deleId) dele
     <> " deleted"
@@ -156,7 +151,7 @@ instance Serialize DeleReply where
 
 -- +OK restored <count> messages (<size> octets)
 instance Serialize RsetReply where
-  serialize rset = pure $ ok
+  serialize rset = pure $ okInd
     <> " restored "
     <> (pack . show . rsetCount) rset
     <> " messages ("
@@ -181,23 +176,23 @@ instance Serialize UidlReply where
   serialize list = case list of
     UidlOne entry -> do
       s <- serialize entry
-      pure $ ok <> " " <> s <> crlf
+      pure $ okInd <> " " <> s <> crlf
     UidlAll entries -> do
       serialized <- mapM serialize entries
-      pure $ intercalate crlf (ok : serialized ++ [term])
+      pure $ intercalate crlf (okInd : serialized ++ [term])
 
 -- +OK <user> POP3 server signing off
 -- +OK <user> POP3 server signing off (maildrop empty)
 -- +OK <user> POP3 server signing off (<count> messages left)
 instance Serialize QuitReply where
   serialize quit = pure $ case quitCount quit of
-    Nothing -> ok
+    Nothing -> okInd
       <> " POP3 server signing off"
       <> crlf
-    Just 0 -> ok
+    Just 0 -> okInd
       <> " POP3 server signing off (maildrop empty)"
       <> crlf
-    Just count -> ok
+    Just count -> okInd
       <> " POP3 server signing off ("
       <> (pack . show) count
       <> " messages left)"
@@ -205,7 +200,7 @@ instance Serialize QuitReply where
 
 -- -Err <msg>
 instance Serialize SessionErr where
-  serialize erro = pure $ err
+  serialize err = pure $ errInd
     <> " "
-    <> (pack . show) erro
+    <> (pack . show) err
     <> crlf

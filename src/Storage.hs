@@ -10,14 +10,15 @@ module Storage
   , updateMailbox
   ) where
 
-import Control.Exception (bracket, catch, throwIO)
+import qualified UnliftIO as UIO
+import Control.Exception (catch, throwIO)
 import Data.List (stripPrefix)
 import Data.Set (Set)
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Time.Clock.POSIX (POSIXTime)
-import GHC.IO.Exception (IOErrorType (AlreadyExists, NoSuchThing))
+import GHC.IO.Exception (IOErrorType (AlreadyExists))
 import System.Directory (listDirectory, renameFile)
 import System.FilePath
 import System.Posix
@@ -35,8 +36,11 @@ import Error
   , SysErr, annotate, classify, corruptMailErr
   )
 
-import Config (storageRoot)
 import Types (Username (unUser), UID (unUID), readUID)
+import App (App, AppEnv (config))
+import Control.Monad.RWS (asks, MonadIO (liftIO))
+import Config (StorageConfig(mailRoot, lockName), Config (storage))
+import Constant (mailSep, curName, newName)
 
 -- Data
 
@@ -65,12 +69,10 @@ data Lock = Lock
 
 data StorageErr
   = UserLocked
-  | NoSuchUser
 
 instance Show StorageErr where
   show err = case err of
     UserLocked -> "mailbox in use"
-    NoSuchUser -> "invalid credentials"
 
 -- Syscalls
 
@@ -95,7 +97,7 @@ tryUnlink path = annotate (OpUnlink path) call
   where call = removeLink path
 
 tryListDir :: FilePath -> IO [FilePath]
-tryListDir path = annotate (OpListDir path) call
+tryListDir path = annotate OpListDir call
   where call = map (path </>) <$> listDirectory path
 
 tryStatFile :: FilePath -> IO FileStatus
@@ -108,23 +110,16 @@ tryMove src dst = annotate (OpMove src dst) call
 
 -- Layout
 
-lockName :: FilePath
-lockName = ".lock"
+userMailbox :: Username -> App FilePath
+userMailbox user = do
+  root <- asks (mailRoot . storage . config)
+  pure (root </> unUser user)
 
-curName :: FilePath
-curName = "cur"
-
-newName :: FilePath
-newName = "new"
-
-mailSep :: FilePath
-mailSep = ":2"
-
-userRoot :: Username -> FilePath
-userRoot user = storageRoot </> unUser user
-
-userLockPath :: Username -> FilePath
-userLockPath user = userRoot user </> lockName
+userLockPath :: Username -> App FilePath
+userLockPath user = do
+  name    <- asks (lockName . storage . config)
+  mailbox <- userMailbox user
+  pure (mailbox </> name)
 
 -- Lock
 
@@ -148,12 +143,12 @@ fileWithSizes path = do
   files <- fileWithStat path
   pure [(fp, fileSize st) | (fp, st) <- files, isRegularFile st]
 
-maildirFiles :: Username -> IO [(FilePath, FileOffset)]
+maildirFiles :: Username -> App [(FilePath, FileOffset)]
 maildirFiles user = do
-  let userPath = userRoot user
+  userPath <- userMailbox user
 
-  curFiles <- fileWithSizes (userPath </> curName)
-  newFiles <- fileWithSizes (userPath </> newName)
+  curFiles <- liftIO $ fileWithSizes (userPath </> curName)
+  newFiles <- liftIO $ fileWithSizes (userPath </> newName)
 
   pure (curFiles <> newFiles)
 
@@ -220,27 +215,29 @@ moveMessage root msg = tryMove src (root </> dir </> dst)
 
 -- Methods
 
-withLock :: Username -> (Lock -> IO a) -> IO (Either StorageErr a)
+withLock :: Username -> (Lock -> App a) -> App (Either StorageErr a)
 withLock user action = do
-  result <- (Right <$> acquireLock (userLockPath user))
+  path   <- userLockPath user
+  result <- liftIO $ (Right <$> acquireLock path)
     `catch` \(err :: SysErr) -> case classify err of
       AlreadyExists -> pure $ Left UserLocked
-      NoSuchThing   -> pure $ Left NoSuchUser
       _             -> throwIO err
 
   case result of
     Left e     -> pure $ Left e
-    Right lock -> Right <$> bracket (pure lock) releaseLock action
+    Right lock -> Right <$> UIO.bracket (pure lock) (liftIO . releaseLock) action
 
-fetchMailbox :: Lock -> Username -> IO (Seq Message)
+fetchMailbox :: Lock -> Username -> App (Seq Message)
 fetchMailbox _ user = do
   maybeMsgs <- mapM buildMessage <$> maildirFiles user
 
   case maybeMsgs of
-    Nothing   -> throwIO corruptMailErr
+    Nothing   -> liftIO $ throwIO corruptMailErr
     Just msgs -> pure $ Seq.fromList msgs
 
-updateMailbox :: Lock -> Username -> [Message] -> [Message] -> IO ()
+updateMailbox :: Lock -> Username -> [Message] -> [Message] -> App ()
 updateMailbox _ user trash seen = do
-  mapM_ (moveMessage (userRoot user)) seen
-  mapM_ deleMessage trash
+  mailbox <- userMailbox user
+
+  liftIO $ mapM_ (moveMessage mailbox) seen
+  liftIO $ mapM_ deleMessage trash

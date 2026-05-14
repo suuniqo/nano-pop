@@ -5,8 +5,9 @@ module Log
 
 import System.IO (hPrint, stderr)
 import Data.List (intercalate)
-import Config (progName)
 import Control.Concurrent (ThreadId, myThreadId)
+
+import Constant (progName)
 
 data Severity
   = Info
@@ -26,6 +27,6 @@ instance Show LogData where
 emitEntry :: LogData -> IO ()
 emitEntry = hPrint stderr
 
-emit :: Show a => Severity -> a -> IO ()
-emit sever a = entry >>= emitEntry
-  where entry = LogData sever (show a) <$> myThreadId
+emit :: Severity -> String -> IO ()
+emit sever msg = entry >>= emitEntry
+  where entry = LogData sever msg <$> myThreadId

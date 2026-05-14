@@ -14,7 +14,7 @@ import Data.Char (isAlphaNum)
 newtype Username = Username { unUser :: String }
 
 instance Show Username where
-  show = show . unUser
+  show = unUser
 
 userValidate :: ByteString -> Maybe Username
 userValidate user
@@ -35,8 +35,8 @@ toIdx (MsgNo num) = num - 1
 msgEnum :: [MsgNo]
 msgEnum = MsgNo <$> [1..]
 
-maxWord :: Integer
-maxWord = toInteger (maxBound :: Int)
+maxInt :: Integer
+maxInt = toInteger (maxBound :: Int)
 
 readMsgNo :: BS.ByteString -> Maybe MsgNo
 readMsgNo bs = do
@@ -44,7 +44,7 @@ readMsgNo bs = do
 
     if BS.null rest
        && n > 0
-       && n <= maxWord
+       && n <= maxInt
     then Just (MsgNo $ fromInteger n)
     else Nothing
 

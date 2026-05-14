@@ -1,56 +1,96 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module Config
-  ( progName
-  , listenBacklog
-  , backoffMin
-  , backoffMax
-  , idleTimeout
-  , readChunk
-  , storageRoot
-  , maxSizeQuery
-  , maxSizeResponse
+  ( loadConfig
+  , Config (..)
+  , StorageConfig (..)
+  , NetworkConfig (..)
   ) where
 
--- Auxiliary
+import Toml (TomlCodec, (.=))
+import qualified Toml
 
-secInMicro :: Int
-secInMicro = 1000000
+import Log (Severity(Warn), emit)
+import Control.Exception (try, IOException)
 
-minInMicro :: Int
-minInMicro = 60 * secInMicro
+-- Data
 
--- Flexible (Admin)
+-- | General application settings.
+data StorageConfig = StorageConfig
+  { mailRoot :: FilePath -- ^ Root directory for user mailboxes
+  , passName :: String   -- ^ Service name or port number (e.g. "pop3" or "110")
+  , lockName :: String   -- ^ Service name or port number (e.g. "pop3" or "110")
+  }
 
-progName :: String
-progName = "nano-pop"
+-- | Network and I/O tuning settings.
+data NetworkConfig = NetworkConfig
+  { port          :: String -- ^ Service name or port number (e.g. "pop3" or "110")
+  , idleTimeout   :: Int    -- ^ autologout timeout for idle clients
+  , listenBacklog :: Int    -- ^ TCP listen backlog queue depth
+  , backoffMin    :: Int    -- ^ Minimum retry backoff in microseconds
+  , backoffMax    :: Int    -- ^ Maximum retry backoff in microseconds
+  , readChunk     :: Int    -- ^ Bytes per read syscall
+  }
 
-listenBacklog :: Int
-listenBacklog = 16
+-- | Top-level config, composed of named sections.
+data Config = Config
+  { storage :: StorageConfig
+  , network :: NetworkConfig
+  }
 
-backoffMin :: Int
-backoffMin = secInMicro `div` 16
 
-backoffMax :: Int
-backoffMax = secInMicro * 16
+-- Codecs
 
-readChunk :: Int
-readChunk = 4096
+storageCodec :: TomlCodec StorageConfig
+storageCodec = StorageConfig
+  <$> Toml.string "mail_root" .= mailRoot
+  <*> Toml.string "pass_name" .= passName
+  <*> Toml.string "lock_name" .= lockName
 
-storageRoot :: FilePath
-storageRoot = "/Users/sunico/mail"
+networkCodec :: TomlCodec NetworkConfig
+networkCodec = NetworkConfig
+  <$> Toml.string "port"        .= port
+  <*> Toml.int "idle_timeout"   .= idleTimeout
+  <*> Toml.int "listen_backlog" .= listenBacklog
+  <*> Toml.int "backoff_min"    .= backoffMin
+  <*> Toml.int "backoff_max"    .= backoffMax
+  <*> Toml.int "read_chunk"     .= readChunk
 
--- Fixed (Protocol)
+configCodec :: TomlCodec Config
+configCodec = Config
+  <$> Toml.table storageCodec "storage" .= storage
+  <*> Toml.table networkCodec "network" .= network
 
-maxSizeKeyword :: Int
-maxSizeKeyword = 4
 
-maxSizeArg :: Int
-maxSizeArg = 40
+-- Loading
 
-maxSizeQuery :: Int
-maxSizeQuery = maxSizeKeyword + 1 + maxSizeArg + 2
+defaultConfig :: Config
+defaultConfig = Config
+  { storage = StorageConfig
+      { passName = "shadow"
+      , lockName = ".lock"
+      , mailRoot = "/var/npop"
+      }
+  , network = NetworkConfig
+      { port          = "pop3"
+      , idleTimeout   = 600000000
+      , listenBacklog = 16
+      , backoffMin    = 62500
+      , backoffMax    = 16000000
+      , readChunk     = 4096
+      }
+  }
 
-maxSizeResponse :: Int
-maxSizeResponse = 512
+loadConfig :: FilePath -> IO Config
+loadConfig path = do
+  result <- try $ Toml.decodeFileEither configCodec path
 
-idleTimeout :: Int
-idleTimeout = minInMicro * 10
+  case result of
+    Left (_ :: IOException) -> do
+      emit Warn "no config file, using defaults"
+      pure defaultConfig
+    Right (Left err)  -> do
+      emit Warn $ "config err, using defaults: " <> show err
+      pure defaultConfig
+    Right (Right config) -> pure config
